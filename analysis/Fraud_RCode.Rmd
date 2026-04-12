@@ -1,0 +1,1624 @@
+---
+title: "Fraud_Report_Model_Development"
+output: pdf_document
+date: "2026-02-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup install packages}
+##Install necessary libraries from this code chunk if needed.
+#Skip if packages already installed.
+
+install.packages("dplyr")
+install.packages("MASS")
+install.packages("lubridate")
+install.packages("forecast")
+install.packages("here")
+```
+
+```{r setup}
+#Libraries necessary for code usage.
+library(dplyr)
+library(lubridate)
+library(MASS)
+library(forecast)
+library(here)
+```
+
+```{r functions for repetitive tasks}
+#------------------------------------------------#
+# Inject synthetic anomalies (5% of data)        #
+# nc = not contaminated, c = contaminated        #
+#------------------------------------------------#
+
+inject_anomalies <- function(data_nc, k = 3) {
+  
+  data_c <- data_nc
+  
+  # number of spikes (5% of series)
+  n_spikes <- round(length(data_nc) * 0.05)
+  
+  # standard deviation of series
+  s <- sd(data_nc, na.rm = TRUE)
+  
+  # randomly choose points to contaminate
+  idx <- sample(seq_along(data_nc), n_spikes)
+  
+  # inject spikes
+  data_c[idx] <- data_c[idx] + k * s   # add k * sd
+  
+  return(list(
+    contaminated_series = data_c,
+    spike_indices       = idx
+  ))
+}
+
+#------------------------------------------------#
+#    Convert forecasts to table                  #
+#------------------------------------------------#
+
+forecast_table <- function(fc,
+                           fraud_type,
+                           metric,
+                           start_date = as.Date("2025-09-29")) {
+  
+  future_dates <- seq(
+    from       = start_date + 1,
+    by         = "day",
+    length.out = length(fc$mean)
+  )
+  
+# Convert ts objects to numeric vectors
+  lower <- if (!is.null(fc$lower)) {
+    matrix(as.numeric(fc$lower), ncol = ncol(fc$lower))
+  } else {
+    matrix(NA, nrow = length(fc$mean), ncol = 2)
+  }
+  
+  upper <- if (!is.null(fc$upper)) {
+    matrix(as.numeric(fc$upper), ncol = ncol(fc$upper))
+  } else {
+    matrix(NA, nrow = length(fc$mean), ncol = 2)
+  }
+  
+  # Ensure 2 columns for 80% and 95% intervals
+  if (ncol(lower) == 1) lower <- cbind(lower, NA)
+  if (ncol(upper) == 1) upper <- cbind(upper, NA)
+  
+  data.frame(
+    Date        = future_dates,
+    Metric      = metric,
+    Fraud_Type  = fraud_type,
+    Forecast    = as.numeric(fc$mean),
+    Lower_80    = lower[, 1],
+    Upper_80    = upper[, 1],
+    Lower_95    = lower[, 2],
+    Upper_95    = upper[, 2]
+  )
+}
+
+#---------------------------------------------------------------#
+#    Rolling Window Cross Validation (fixed ARIMA structure)    #
+#---------------------------------------------------------------#
+rolling_validate_arima <- function(series,
+                                   fitted_model,
+                                   window_size = 30,
+                                   h = 1) {
+  
+  n    <- length(series)
+  pred <- rep(NA, n)
+  
+  for (t in window_size:(n - h)) {
+    
+    # rolling training window
+    train_window <- series[(t - window_size + 1):t]
+    
+    # refit same ARIMA structure
+    fit_roll <- Arima(train_window, model = fitted_model)
+    
+    # h-step ahead forecast
+    pred[t + h] <- forecast(fit_roll, h = h)$mean[h]
+  }
+  
+  # align actual vs forecast
+  actual        <- series[(window_size + h):n]
+  forecast_vals <- pred[(window_size + h):n]
+  
+  # error metrics
+  mae  <- mean(abs(actual - forecast_vals), na.rm = TRUE)
+  mse  <- mean((actual - forecast_vals)^2, na.rm = TRUE)
+  rmse <- sqrt(mse)
+  
+  return(list(
+    actual   = actual,
+    forecast = forecast_vals,
+    pred_all = pred,
+    MAE      = mae,
+    MSE      = mse,
+    RMSE     = rmse
+  ))
+}
+```
+
+
+```{r importing data}
+fraud_data <- read.csv(here("data", "processed", "aggregated_fraud_daily.csv"))
+fraud_data$Date.Received...Date.recue <- as.Date(fraud_data$Date.Received...Date.recue, format = "%Y-%m-%d")
+```
+
+
+```{r Checking for historic past data spikes to handle}
+#----------------------------------------------#
+#   Aggregate all fraud data daily             #
+#----------------------------------------------#
+
+fraud_all_daily <- fraud_data %>%
+  mutate(Date.Received...Date.recue = 
+           as.Date(Date.Received...Date.recue)) %>%
+  group_by(Date.Received...Date.recue) %>%
+  summarise(total_victims = sum(total_victims, na.rm = TRUE)) %>%
+  arrange(Date.Received...Date.recue)
+
+df_area <- fraud_data %>%
+  mutate(Date.Received...Date.recue = 
+           as.Date(Date.Received...Date.recue)) %>%
+  group_by(Date.Received...Date.recue, Fraud_type) %>%
+summarise(total = sum(total_victims), .groups = "drop")
+
+## -- Fraud prevention month markers (March 3 each year)  -- ##
+years <- unique(format(fraud_data$Date.Received...Date.recue, "%Y"))
+march3_dates <- as.Date(paste0(years, "-03-03"))
+
+#----------------------------------------------#
+#       Plot: All fraud cases (daily)          #
+#----------------------------------------------#
+plot(fraud_all_daily$Date.Received...Date.recue,
+     fraud_all_daily$total_victims,
+     type = "l",
+     xlab = "Date",
+     ylab = "Total Daily Fraud Victims",
+     main = "All Fraud Cases Combined (Daily)")
+
+abline(v = as.numeric(as.Date("2022-10-01")), col = "red", lwd = 2)
+abline(v = march3_dates, col = "purple", lty = 2, lwd = 2)
+
+legend("topright",
+       legend = c("End of COVID-19 Lockdown",
+                  "Fraud Prevention Month"),
+       col = c("red", "blue"),
+       lty = c(1, 2),
+       lwd = 2,
+       bty = "n")
+lines(smooth.spline(
+    as.numeric(fraud_all_daily$Date.Received...Date.recue),
+    fraud_all_daily$total_victims
+  ), col = "blue", lwd = 2)
+mtext(paste("Fig 1", ".","All Fraud Reported Victims"), #captions
+      side = 1, line = 4, cex = 0.8)
+ 
+# Note: data does not stabilize until late 2023
+
+#----------------------------------------------#
+#      Top 10 fraud types (entire dataset)     #
+#----------------------------------------------#
+all_top10 <- head(sort(table(fraud_data$Fraud_type), decreasing = TRUE), 10)
+all_top10_names <- names(all_top10)
+
+fraud_topall <- fraud_data %>%
+  filter(Fraud_type %in% all_top10_names)
+
+par(mfrow = c(1, 1))
+
+#----------------------------------------------#
+#   Aggregate by fraud type and date           #
+#----------------------------------------------#
+fraud_daily <- aggregate(
+  cbind(total_victims, total_loss) ~ Fraud_type + Date.Received...Date.recue,
+  data = fraud_topall,
+  FUN = sum
+)
+
+all_list <- split(fraud_daily, fraud_daily$Fraud_type)
+
+## -- Plot: Top 10 fraud types over time  -- ##
+for (ft in names(all_list)) {
+  
+  df_ft <- all_list[[ft]]
+  df_ft <- df_ft[order(df_ft$Date.Received...Date.recue), ]
+  
+  plot(df_ft$Date.Received...Date.recue,
+       df_ft$total_victims,
+       type = "l",
+       main = ft,
+       xlab = "Date",
+       ylab = "Daily Victims")
+  
+  abline(v = as.numeric(as.Date("2022-10-01")), col = "red", lwd = 2)
+  abline(v = march3_dates, col = "purple", lty = 2, lwd = 2)
+  
+  legend("topright",
+         legend = c("End of COVID-19 Lockdown",
+                    "Fraud Prevention Month"),
+         col = c("red", "blue"),
+         lty = c(1, 2),
+         lwd = 2,
+         bty = "n")
+}
+
+#----------------------------------------------#
+# Top 5 fraud types (2024–2025 focus)
+#----------------------------------------------#
+fraud_2024 <- fraud_daily %>%
+  mutate(Date.Received...Date.recue = as.Date(Date.Received...Date.recue)) %>%
+  filter(Date.Received...Date.recue >= as.Date("2024-01-01"))
+
+top5fraud <- head(sort(table(fraud_2024$Fraud_type), decreasing = TRUE), 5)
+top5_names <- names(top5fraud)
+
+fraud_top5 <- fraud_daily %>%
+  filter(Fraud_type %in% top5_names)
+
+top5_list <- split(fraud_top5, fraud_top5$Fraud_type)
+
+#----------------------------------------------#
+# Plot: Top 5 fraud types
+#----------------------------------------------#
+
+par(mfrow = c(3, 3)) #Plotting all reports and top 5 fraud type reports together.
+fig_num=2
+for (ft in names(top5_list)) {
+  
+  df_ft <- top5_list[[ft]]
+  
+  plot(df_ft$Date.Received...Date.recue, #plotting 2021 to 2025 report count of top 5 fraud types.
+       df_ft$total_victims,
+       type = "l",
+       main = ft,
+       xlab = "Date",
+       ylab = "Daily Victims")
+  lines(smooth.spline(
+    as.numeric(df_ft$Date.Received...Date.recue),
+    df_ft$total_victims
+  ), col = "blue", lwd = 2)
+  
+ label_ft <- if (grepl("fraud", ft, ignore.case = TRUE)) { #conditionally adding the word fraud if not in the name
+  ft
+} else {
+  paste(ft, "Fraud")
+}
+
+mtext(paste("Fig", fig_num, ".", label_ft, "Reported Victims"), #captions
+      side = 1, line = 4, cex = 0.6)
+  fig_num <- fig_num + 1
+}
+
+#----------------------------------------------#
+# Plot: All fraud (again for comparison)
+#----------------------------------------------#
+
+plot(fraud_all_daily$Date.Received...Date.recue,
+     fraud_all_daily$total_victims,
+     type = "l",
+     xlab = "Date",
+     ylab = "Total Daily Fraud Victims",
+     main = "All Fraud Cases Combined (Daily)")
+lines(smooth.spline(
+    as.numeric(fraud_all_daily$Date.Received...Date.recue),
+    fraud_all_daily$total_victims
+  ), col = "blue", lwd = 2)
+mtext(paste("Fig", 7, ".", "All Fraud Reported Victims"),
+        side = 1, line = 4, cex = 0.6)
+
+
+```
+
+```{r Repeating stationary check for monetary loss}
+# ------------------------------------------------------------#
+# Aggregate Data: Total Monetary Loss                         #
+# ------------------------------------------------------------#
+fraud_all_daily.loss <- fraud_daily %>%
+  mutate(Date.Received...Date.recue =
+           as.Date(Date.Received...Date.recue)) %>%
+  group_by(Date.Received...Date.recue) %>%
+  summarise(total_loss = sum(total_loss, na.rm = TRUE)) %>%
+  arrange(Date.Received...Date.recue)
+
+# -----------------------------------------------------#
+# Stationarity check: monetary loss                    #
+# -----------------------------------------------------#
+par(mfrow = c(3, 3))
+
+for (ft in names(top5_list)) { #monetary loss of top 5 fraud types
+  
+  df_ft <- top5_list[[ft]]
+  
+  plot(df_ft$Date.Received...Date.recue,
+       df_ft$total_loss,
+       type = "l",
+       main = ft,
+       xlab = "Date",
+       ylab = "Daily loss")
+   lines(smooth.spline(
+    as.numeric(df_ft$Date.Received...Date.recue),
+    df_ft$total_loss
+  ), col = "blue", lwd = 2)
+  
+ label_ft <- if (grepl("fraud", ft, ignore.case = TRUE)) { #conditionally adding the word fraud if not in the name
+  ft
+} else {
+  paste(ft, "Fraud")
+}
+
+mtext(paste("Fig", fig_num, ".", label_ft, "Monetary Loss"), #captions
+      side = 1, line = 4, cex = 0.6)
+  fig_num <- fig_num + 1
+}
+
+plot(fraud_all_daily.loss$Date.Received...Date.recue, #monetary loss (total)
+     fraud_all_daily.loss$total_loss,
+     type = "l",
+     xlab = "Date",
+     ylab = "Total Daily Monetary Loss (CAD)",
+     main = "All Fraud Cases Combined (Daily)")
+lines(smooth.spline(
+    as.numeric(fraud_all_daily.loss$Date.Received...Date.recue),
+    fraud_all_daily.loss$total_loss
+  ), col = "blue", lwd = 2)
+mtext(paste("Fig", 13, ".", "All Reported Fraud Monetary Loss"),
+        side = 1, line = 4, cex = 0.6)
+
+
+# Note: relatively stationary with occasional spikes
+```
+
+
+```{r data split for top 5 fraud}
+# ------------------------------------------------------------#
+# Select top 5 fraud types (based on 2024 frequency)          #
+# ------------------------------------------------------------#
+# Skipping low-frequency fraud types due to insufficient data
+top5fraud  <- head(sort(table(fraud_2024$Fraud_type), decreasing = TRUE), 5)
+top5_names <- names(top5fraud)
+
+
+# ----------------------------------------------#
+# Filter dataset to top 5 fraud types           #
+# ----------------------------------------------#
+fraud_data_top5 <- fraud_daily %>%
+  filter(Fraud_type %in% top5_names)
+
+
+# ----------------------------------------------#
+# Sort data by fraud type and date              #
+# ----------------------------------------------#
+fraud_data_top5 <- fraud_data_top5 %>%
+  arrange(Fraud_type, Date.Received...Date.recue)
+
+
+# ----------------------------------------------#
+# Split into training and testing datasets      #
+# ----------------------------------------------#
+train_data <- fraud_data_top5 %>%
+  filter(Date.Received...Date.recue < as.Date("2025-01-01"))
+
+test_data <- fraud_data_top5 %>%
+  filter(Date.Received...Date.recue >= as.Date("2025-01-01"))
+
+
+# ----------------------------------------------#
+# Split into lists by fraud type                #
+# ----------------------------------------------#
+train_list <- split(train_data, train_data$Fraud_type)
+test_list  <- split(test_data,  test_data$Fraud_type)
+
+```
+
+```{r ARIMA model for total aggregation fraud count}
+# ------------------------------------------------------------#
+# ALL DATA: Train/Test Split                                  #
+# ------------------------------------------------------------#
+fraud_split_training <- fraud_all_daily %>%
+  filter(Date.Received...Date.recue < as.Date("2025-01-01"))
+
+fraud_split_testing <- fraud_all_daily %>%
+  filter(Date.Received...Date.recue >= as.Date("2025-01-01"))
+
+dates <- fraud_split_training$Date.Received...Date.recue  # store dates
+
+fraud_total_train <- fraud_split_training[["total_victims"]]
+fraud_total_test  <- fraud_split_testing[["total_victims"]]
+
+
+# ----------------------------------------------#
+# Convert data to Time Series                   #
+# ----------------------------------------------#
+fraud_total_train_ts <- ts(fraud_total_train, start = c(2021, 1), frequency = 7)
+fraud_total_test_ts  <- ts(fraud_total_test,  start = c(2025, 1), frequency = 7)
+
+
+# ----------------------------------------------#
+# Fit ARIMA Model                               #
+# ----------------------------------------------#
+total.model <- auto.arima(fraud_total_train_ts, seasonal = TRUE)
+res <- residuals(total.model)
+
+# Residual diagnostics
+tsdiag(total.model)
+acf(res,  main = paste("Residual ACF -", ft))
+pacf(res, main = paste("Residual PACF -", ft))
+
+
+# ----------------------------------------------#
+# Forecasting                                   #
+# ----------------------------------------------#
+fc.total <- forecast(total.model, h = 360)
+
+train_dates  <- fraud_split_training$Date.Received...Date.recue
+future_dates <- seq(from = max(train_dates) + 1,
+                    by = "day",
+                    length.out = 360)
+
+plot(fc.total, include = 365)
+
+
+# ----------------------------------------------#
+# Rolling Window Validation                     #
+# ----------------------------------------------#
+window_size <- 30
+n <- length(fraud_total_test_ts)
+pred <- rep(NA, n)
+
+fraud_total.rolling <- rolling_validate_arima(
+  fraud_total_test_ts,
+  fitted_model = total.model
+)
+
+plot(fraud_total.rolling$actual,
+     type = "l",
+     col = "red",
+     lwd = 2,
+     main = "Rolling Validation - Total Reports",
+     ylab = "Cases",
+     xlab = "Time")
+
+lines(fraud_total.rolling$forecast,
+      col = "blue",
+      lwd = 2)
+
+legend("topleft",
+       legend = c("Actual", "Rolling Forecast"),
+       col = c("red", "blue"),
+       lty = 1,
+       lwd = 2)
+
+MAE  <- fraud_total.rolling$MAE
+RMSE <- fraud_total.rolling$RMSE
+
+actual_total_test <- as.numeric(fraud_total_test_ts)
+range_test_total_test  <- max(actual_total_test ) - min(actual_total_test )
+NMAE.rolling.total <- MAE/ range_test_total_test
+NRMSE.rolling.total <- RMSE / range_test_total_test
+
+# ----------------------------------------------#
+# Naive Model For Comparsion                    #
+# ----------------------------------------------#
+naive_model <- naive(fraud_total_train_ts, h = length(fraud_total_test_ts))
+actual.naive_total_test <- as.numeric(fraud_total_test_ts)
+forecast.naive_total_test <- as.numeric(naive_model$mean)
+
+#Normalizing MAE and RMSE
+mae.naive_total_test  <- mean(abs(forecast.naive_total_test  - actual_total_test ))
+rmse.naive_total_test <- sqrt(mean((forecast.naive_total_test  - actual_total_test )^2))
+
+
+
+nmae.naive_total_test   <- mae.naive_total_test  / range_test_total_test 
+nrmse.naive_total_test  <- rmse.naive_total_test  / range_test_total_test 
+
+# ----------------------------------------------#
+# Anomaly Injection                             #
+# ----------------------------------------------#
+inj <- inject_anomalies(fraud_total_test_ts)
+
+fraud_total_test.contaminated <- inj$contaminated_series
+spike_idx <- inj$spike_indices
+
+
+# ----------------------------------------------#
+# Fit model on 2024 data                        #
+# ----------------------------------------------#
+fraud_total.2024 <- fraud_all_daily %>%
+  filter(Date.Received...Date.recue >= as.Date("2024-01-01"),
+         Date.Received...Date.recue <  as.Date("2025-01-01"))
+
+fraud_total_test.2024 <- fraud_total.2024[["total_victims"]]
+
+fraud_total_2024.ts <- ts(
+  fraud_total_test.2024,
+  start = c(2024, 1),
+  frequency = 7
+)
+
+ft_total.2024 <- Arima(fraud_total_2024.ts, model = total.model)
+
+
+# ----------------------------------------------#
+# Forecast over FULL horizon                    #
+# ----------------------------------------------#
+h <- length(fraud_total_test.contaminated)
+
+fc.total.spike <- forecast(
+  ft_total.2024,
+  h = h,
+  level = 95
+)
+
+
+# ----------------------------------------------#
+# Anomaly detection determination               #
+# ----------------------------------------------#
+y_obs <- as.numeric(fraud_total_test.contaminated)
+
+upper <- as.numeric(fc.total.spike$upper[, 1])
+
+anomaly_flag <- y_obs > upper
+
+detected_idx <- which(anomaly_flag)
+
+
+# ----------------------------------------------#
+# Plot: Forecast + Injected + Detected          #
+# ----------------------------------------------#
+correctly_detected <- intersect(spike_idx, detected_idx)
+
+x <- seq_along(y_obs)
+
+plot(x, y_obs,
+     type = "l",
+     col = "blue",
+     xlab = "Test period index",
+     ylab = "Value",
+     main = "Forecast with Injected and Detected Anomalies")
+
+lines(x, as.numeric(fc.total.spike$mean),  lty = 2)
+lines(x, upper, lty = 3)
+lines(x, as.numeric(fc.total.spike$lower[,1]), lty = 3)
+
+points(spike_idx, y_obs[spike_idx],
+       col = "red", pch = 16, cex = 1.2)
+
+points(correctly_detected, y_obs[correctly_detected],
+       col = "black", pch = 8, cex = 1.8, lwd = 2)
+
+legend("topright",
+       legend = c("Injected spikes", "Correctly detected"),
+       col = c("red", "black"),
+       pch = c(16, 8),
+       pt.cex = c(1.2, 1.8),
+       bty = "n")
+
+
+# -----------------------------------------------------------#
+# Recall over cumulative forecast window horizons            #
+# -----------------------------------------------------------#
+
+# Create labels
+n <- length(y_obs)
+
+true_labels <- rep(0, n)
+pred_labels <- rep(0, n)
+
+true_labels[spike_idx] <- 1
+pred_labels[detected_idx] <- 1
+
+
+# Define cumulative horizons (e.g. every 30 days)
+cutoffs <- seq(30, n, by = 30)
+
+recall_values <- c()
+precision_values <- c()
+f1_values <- c()
+
+for (c in cutoffs) {
+  
+  t <- true_labels[1:c]
+  p <- pred_labels[1:c]
+  
+  TP <- sum(t == 1 & p == 1)
+  FP <- sum(t == 0 & p == 1)
+  FN <- sum(t == 1 & p == 0)
+  TN <- sum(t == 0 & p == 0)
+  
+  recall <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+  precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
+  f1 <- ifelse((precision + recall) == 0, 0, 2 * precision * recall / (precision + recall))
+   
+  recall_values <- c(recall_values, recall)
+  precision_values <- c(precision_values, precision)
+  f1_values        <- c(f1_values, f1)
+}
+
+
+# ----------------------------------------------#
+# Plot: Recall vs Forecast Horizon              #
+# ----------------------------------------------#
+
+plot(cutoffs, recall_values,
+     type = "b",
+     col = "blue",
+     pch = 16,
+     ylim = c(0,1),
+     xlab = "Forecast Horizon (Days)",
+     ylab = "Recall",
+     main = "Recall vs Forecast Horizon (Interval Detection)")
+
+AD_total_df <- data.frame( #saving values for dashboard
+  Fraud_Type = "Total",
+  Horizon = cutoffs,
+  Recall = recall_values,
+  Precision = precision_values,
+  F1 = f1_values
+)
+```
+
+```{r Not useable ROC Curve}
+# -----------------------------------------------------------#
+# Loop: Injection, Detection and ROC Curve Creation (Failed) #
+# -----------------------------------------------------------#
+#NOTE: ROC curve was found to not be a useful metric given high specificity as a result of the synthetic anomaly injection using the standard data+(3*standard deviation), as well as the low alpha level of a 95% prediction interval. This part may be skipped.
+
+# Defining the thresholds/prediction interval levels for ROC testing
+levels_to_test <- c(seq(75, 95, by = 5), 97.5, 99, 99.5, 99.9)
+roc_results <- data.frame(Level = numeric(), TPR = numeric(), FPR = numeric())
+
+# Run the detection simulation
+inj <- inject_anomalies(fraud_total_test.2024,k=3)
+fraud_contaminated <- as.numeric(inj$contaminated_series)
+spike_idx <- inj$spike_indices
+
+for (lvl in levels_to_test) {
+  
+  # Generate forecast at the given confidence level
+  fc_test <- forecast(ft_total.2024, h = length(fraud_contaminated), level = lvl)
+  
+  # Anomaly Detection for current level
+  upper_bound <- as.numeric(fc_test$upper[, 1])
+  detected_idx <- which(fraud_contaminated > upper_bound)
+  
+  # Confusion Matrix Calculations
+  TP <- length(intersect(spike_idx, detected_idx))
+  FP <- length(setdiff(detected_idx, spike_idx))
+  FN <- length(setdiff(spike_idx, detected_idx))
+  TN <- length(fraud_contaminated) - TP - FP - FN
+  
+  # Calculating Rates for ROC Curve
+  TPR <- TP / (TP + FN) # Sensitivity
+  FPR <- FP / (FP + TN) # 1 - Specificity
+  
+  roc_results <- rbind(roc_results, data.frame(Level = lvl, TPR = TPR, FPR = FPR))
+}
+
+# Plotting the Manual ROC Curve
+plot(roc_results$FPR, roc_results$TPR, 
+     type = "b", pch = 19, col = "blue",
+     xlim = c(0, 1), ylim = c(0, 1),
+     xlab = "False Positive Rate (1 - Specificity)",
+     ylab = "True Positive Rate (Sensitivity)",
+     main = "ROC Curve: Varying Forecast Intervals")
+
+# 45 degree line to compare against random testing
+abline(a = 0, b = 1, lty = 2, col = "red")
+
+# Labeling the points with the confidence level
+text(roc_results$FPR, roc_results$TPR, labels = roc_results$Level, pos = 4, cex = 0.7)
+
+
+#As noted from above, due to the incredibly low false positive rate (FPR), the ROC is not a good measurement for the anomaly detection accuracy. Instead, it will be simpler and more useful to utilise the sensitivity as a metric.
+
+```
+
+```{r final model refit for total fraud}
+# ----------------------------------------------#
+# Final Model Refit (2023 onward)               #
+# ----------------------------------------------#
+fraud_full_refit <- fraud_all_daily %>%
+  filter(Date.Received...Date.recue >= as.Date("2023-01-01"))
+
+fraud_refit_2023 <- fraud_full_refit[["total_victims"]]
+
+fraud_total_ts <- ts(fraud_refit_2023)
+
+total.Refit <- Arima(fraud_total_ts, model = total.model)
+
+fc.total.final <- forecast(total.Refit, h = 240)
+
+plot(fc.total.final, include = 180)
+
+
+# ----------------------------------------------#
+# Export Forecast Table                         #
+# ----------------------------------------------#
+all_fraud_fc <- forecast_table(
+  fc.total.final,
+  "Total",
+  "Victim_Count"
+)
+
+
+```
+
+```{r TBATS model for total aggregation Monetary Loss}
+# ----------------------------------------------#
+# ALL DATA: Monetary Loss                       #
+# ----------------------------------------------#
+# TBATS exponential smoothing model
+fraud_daily_training.loss <- fraud_all_daily.loss %>%
+  filter(Date.Received...Date.recue < as.Date("2025-01-01"))
+
+fraud_daily_testing.loss <- fraud_all_daily.loss %>%
+  filter(Date.Received...Date.recue >= as.Date("2025-01-01"))
+
+
+# ----------------------------------------------#
+# Split into Training and Testing Data          #
+# ----------------------------------------------#
+daily_total_train.loss <- fraud_daily_training.loss[["total_loss"]]
+daily_total_test.loss  <- fraud_daily_testing.loss[["total_loss"]]
+
+
+# ----------------------------------------------#
+# Convert to msts Objects                       #
+# ----------------------------------------------#
+fraud_train.loss.ts <- ts(daily_total_train.loss,7)
+fraud_test.loss.ts  <- ts(daily_total_test.loss,7)
+
+fraud_total_train.loss.ts <- msts(daily_total_train.loss, seasonal.periods = 7)
+fraud_total_test.loss.ts  <- msts(daily_total_test.loss, seasonal.periods = 7)
+
+
+# ----------------------------------------------#
+# Fit Monetary Loss ARIMA Models                #
+# ----------------------------------------------#
+fit_arima.loss <- auto.arima(fraud_train.loss.ts)
+fit_tbats <- tbats(fraud_total_train.loss.ts)
+
+# ----------------------------------------------#
+# Model Diagnostics                             #
+# ----------------------------------------------#
+summary(fit_tbats)
+checkresiduals(fit_tbats)
+
+
+# ----------------------------------------------#
+# Forecast on Test Horizon                      #
+# ----------------------------------------------#
+
+fc_arima.loss <- forecast(fit_arima.loss,h=length(fraud_test.loss.ts))
+fc_tbats <- forecast(fit_tbats, h = length(fraud_total_test.loss.ts))
+
+fraud_total_test.loss.ts <- msts( #Aligning test data axis
+  daily_total_test.loss,
+  start = tsp(fc_tbats$mean)[1],
+  seasonal.periods = 7
+)
+
+fraud_test.loss.ts <- ts( #Setting start index of test data to forecast
+  fraud_test.loss.ts,
+  start = start(fc_arima.loss$mean),
+  frequency = frequency(fc_arima.loss$mean)
+)
+# ----------------------------------------------#
+# Plot: Forecast vs Actual                      #
+# ----------------------------------------------#
+plot(fc_tbats, include = 30)
+
+lines(fraud_total_test.loss.ts, col = "red")
+
+legend("topleft",
+       legend = c("actual", "forecast"),
+       col = c("red", "blue"),
+       pch = c(16, 16),
+       pt.cex = c(1.2, 1.2),
+       bty = "n")
+
+accuracy(fc_tbats, fraud_total_test.loss.ts)
+
+accuracy(fc_arima.loss,fraud_test.loss.ts)
+
+# ----------------------------------------------#
+# Naive Model For Comparsion                    #
+# ----------------------------------------------#
+actual_total_test.loss <- as.numeric(fraud_total_test.loss.ts)
+range_test_total_test.loss  <- max(actual_total_test.loss ) - min(actual_total_test.loss )
+
+naive_model.loss <- naive(fraud_train.loss.ts, h = length(fraud_total_test.loss.ts))
+actual.naive_total_test.loss <- as.numeric(fraud_total_test.loss.ts)
+forecast.naive_total_test.loss <- as.numeric(naive_model.loss$mean)
+
+#Normalizing MAE and RMSE
+mae.naive_total_test.loss  <- mean(abs(forecast.naive_total_test.loss  - actual_total_test.loss ))
+rmse.naive_total_test.loss <- sqrt(mean((forecast.naive_total_test.loss  - actual_total_test.loss )^2))
+
+
+nmae.naive_total_test.loss   <- mae.naive_total_test.loss  / range_test_total_test.loss 
+nrmse.naive_total_test.loss  <- rmse.naive_total_test.loss  / range_test_total_test.loss 
+
+
+
+# ----------------------------------------------#
+# Final Refit on All Data                       #
+# ----------------------------------------------#
+all_daily.loss <- fraud_all_daily.loss[["total_loss"]]
+all_daily.loss.tbat <- msts(all_daily.loss, seasonal.periods = 7)
+
+fit_all_tbats.loss <- tbats(all_daily.loss.tbat)
+
+
+# ----------------------------------------------#
+# Final Forecasts                               #
+# ----------------------------------------------#
+fc_tbats_2026.loss <- forecast(fit_all_tbats.loss, h = 180)
+plot(fc_tbats_2026.loss, include = 120)
+
+fc_tbats_final_total.loss <- forecast(fit_all_tbats.loss, h = 240)
+plot(fc_tbats_final_total.loss, include = 60)
+
+
+# ----------------------------------------------#
+# Convert Forecasts to Table                    #
+# ----------------------------------------------#
+all_Loss_fc <- forecast_table(
+  fc_tbats_final_total.loss,
+  "Total",
+  "Monetary_Loss",
+)
+```
+
+```{r ARIMA,TBATS, Naive Model NMAE and NRMSE}
+# --------------------------------------------------------#
+# Table for MAE and RMSE of ARIMA vs TBATS vs NAIVE       #
+# --------------------------------------------------------#
+library(kableExtra)
+
+df <- data.frame(
+  Model = c("ARIMA", "Naive", "TBATS","ARIMA", "Naive"),
+  Outcome = c("Fraud Reports", "Fraud Reports", "Monetary Loss","Monetary Loss", "Monetary Loss"),
+  `Train Size`=c(1458,1458,1458,1458,1458),
+  `Test Size` = c(272, 272,272,272,272),
+  NMAE = c(0.103, 0.228, 0.069,0.095,0.116),
+  NRMSE = c(0.139, 0.266, 0.139,0.148,0.179),
+  check.names = FALSE
+)
+
+tbl <- kbl(
+  df,
+  format = "html",
+  booktabs = TRUE,
+  align = c("l", "l", "c", "c", "c"),
+  digits = 3
+) |>
+  kable_styling(
+    full_width = FALSE,
+    position = "center",
+    font_size = 14
+  ) |>
+  column_spec(1, width = "4em") |>
+  column_spec(2, width = "7em") |>
+  column_spec(3, width = "4em") |>
+  column_spec(4, width = "4em") |>
+  column_spec(5, width = "4em")
+
+
+```
+
+
+
+```{r arima models top 5 fraud types}
+# ---------------------------------------------------------#
+# Fit ARIMA Models and Forecast Case Counts by Fraud Type  #
+# ---------------------------------------------------------#
+models <- list()
+forecasts_cases <- list()
+actual_cases <- list()
+
+for (ft in names(train_list)) {
+  
+  train_ft <- train_list[[ft]]
+  test_ft  <- test_list[[ft]]
+  
+  # -----------------------------------#
+  # Model Fitting for each Fraud Type  #
+  # -----------------------------------#
+  ts_cases <- ts(
+    train_ft$total_victims,
+    start = c(2021, 1),
+    frequency = 7
+  )
+  
+  # Create ARIMA model
+  fit_cases <- auto.arima(ts_cases)
+  
+  h_cases <- nrow(test_ft)
+  
+  # Forecast the ARIMA model
+  fc_cases <- forecast(fit_cases, h = h_cases)
+  
+  # Convert test cases to time series for validation
+  test_cases_ts <- ts(
+    test_ft$total_victims,
+    start = time(fc_cases$mean)[1],
+    frequency = frequency(fc_cases$mean)
+  )
+  
+  models[[ft]]          <- fit_cases
+  forecasts_cases[[ft]] <- fc_cases
+  actual_cases[[ft]]    <- test_cases_ts
+}
+
+
+# ----------------------------------------------#
+# Plot Forecast vs Actual for Each Fraud Type   #
+# ----------------------------------------------#
+for (ft in names(forecasts_cases)) {
+  
+  plot(forecasts_cases[[ft]],
+       main = paste("Forecast vs Actual -", ft),
+       include = 60)
+  
+  lines(actual_cases[[ft]], col = "red", lwd = 2)
+  
+  legend("topleft",
+         legend = c("Forecast", "Actual"),
+         col = c("blue", "red"),
+         lty = 1,
+         lwd = 2)
+}
+
+
+# ----------------------------------------------#
+# Rolling Window Validation                     #
+# ----------------------------------------------#
+rolling_results_cases <- list()
+
+for (ft in names(models)) {
+  
+  test_ft <- test_list[[ft]]
+  
+  test_cases_ts <- ts(
+    test_ft$total_victims,
+    frequency = 7
+  )
+  
+  rolling_results_cases[[ft]] <- rolling_validate_arima(
+    series = test_cases_ts,
+    fitted_model = models[[ft]],
+    window_size = 14,
+    h = 1
+  )
+}
+
+
+# ----------------------------------------------#
+# Plot Rolling Forecast vs Actual               #
+# ----------------------------------------------#
+for (ft in names(rolling_results_cases)) {
+  
+  res <- rolling_results_cases[[ft]]
+  
+  plot(res$actual,
+       type = "l",
+       col = "red",
+       lwd = 2,
+       main = paste("Rolling Validation -", ft),
+       ylab = "Cases",
+       xlab = "Time")
+  
+  lines(res$forecast, col = "blue", lwd = 2)
+  
+  legend("topleft",
+         legend = c("Actual", "Rolling Forecast"),
+         col = c("red", "blue"),
+         lty = 1,
+         lwd = 2)
+}
+
+
+# ----------------------------------------------#
+# Error Metrics Table                           #
+# ----------------------------------------------#
+
+results_table_cases <- data.frame( #storing results of rolling window cross validation
+  Fraud_Type = names(rolling_results_cases),
+  
+  MAE  = sapply(rolling_results_cases, function(x) x$MAE),
+  RMSE = sapply(rolling_results_cases, function(x) x$RMSE),
+  
+  NMAE = sapply(rolling_results_cases, function(x) { #computing normalized MAE
+    valid_actual <- x$actual[!is.na(x$forecast)]
+    x$MAE / (max(valid_actual) - min(valid_actual))
+  }),
+  
+  NRMSE = sapply(rolling_results_cases, function(x) {#computing normalized RMSE
+    valid_actual <- x$actual[!is.na(x$forecast)]
+    x$RMSE / (max(valid_actual) - min(valid_actual))
+  })
+)
+# ----------------------------------------------#
+# One Time Validation                           #
+# ----------------------------------------------#
+for (fraud_type in names(test_list)) {
+  
+  # Extract test data
+  test_data <- test_list[[fraud_type]]
+  
+  test_ts <- ts(
+    test_data$total_victims,
+    frequency = 7
+  )
+  
+  # Forecast
+  h <- length(test_ts)
+  fc <- forecast(models[[fraud_type]], h = h)
+  
+  pred <- as.numeric(fc$mean)
+  actual <- as.numeric(test_ts)
+  
+  # Metrics
+  residuals <- actual - pred
+  
+  MAE  <- mean(abs(residuals))
+  RMSE <- sqrt(mean(residuals^2))
+  
+  range_val <- max(actual) - min(actual)
+  
+  NMAE  <- MAE / range_val
+  NRMSE <- RMSE / range_val
+  
+  # Append results
+  results_table_cases <- rbind(
+    results_table_cases,
+    data.frame(
+      Fraud_Type = paste0(fraud_type, " (One-Time Test)"),
+      MAE = MAE,
+      RMSE = RMSE,
+      NMAE = NMAE,
+      NRMSE = NRMSE
+    )
+  )
+}
+results_table_cases
+```
+
+```{r anomaly detection of top 5 fraud type models}
+#--------------------------------------#
+# Top 5 Anomaly Detection validation   #
+#--------------------------------------#
+anomaly_data <- list()
+forecast_anomaly <- list()
+actual_anomaly   <- list()
+detected <- list()
+confusion_matrix.top5 <- list()
+
+for (ft in names(test_list)) {
+  
+  test_series <- test_list[[ft]]$total_victims
+  
+  injected <- inject_anomalies(test_series, k = 3)
+  
+  anomaly_data[[ft]] <- list(
+    contaminated = injected$contaminated_series,
+    true_idx     = injected$spike_indices
+  )
+}
+
+for (ft in names(models)) {
+  
+  contaminated_ts <- ts(
+    anomaly_data[[ft]]$contaminated,
+    frequency = 7
+  )
+  
+  h <- length(contaminated_ts)
+  
+  fc <- forecast(models[[ft]], h = h)
+  
+  forecast_anomaly[[ft]] <- as.numeric(fc$mean)
+  actual_anomaly[[ft]]   <- as.numeric(contaminated_ts)
+}
+
+for (ft in names(forecast_anomaly)) {
+  
+  predicted<- forecast_anomaly[[ft]]
+  actual <- actual_anomaly[[ft]]
+  
+  residuals <- abs(actual - predicted)
+  
+  # threshold = mean + 3*sd (you can tune this)
+  threshold <- mean(residuals) + 3 * sd(residuals)
+  
+  detected_idx <- which(residuals > threshold)
+  
+  detected[[ft]] <- detected_idx
+}
+
+#------------------------------------------#
+# Creating Confusion Matrix and Results    #
+#------------------------------------------#
+
+for (ft in names(detected)) {
+  
+  true_idx <- anomaly_data[[ft]]$true_idx
+  detected_idx <- detected[[ft]]
+  
+  n <- length(actual_anomaly[[ft]])
+  
+  #Result
+  true_labels <- rep(0, n)
+  predicted_labels <- rep(0, n)
+  
+  true_labels[true_idx] <- 1
+  predicted_labels[detected_idx] <- 1
+  
+  # Confusion matrix 
+  TP <- sum(true_labels == 1 & predicted_labels == 1)
+  FP <- sum(true_labels == 0 & predicted_labels == 1)
+  TN <- sum(true_labels == 0 & predicted_labels == 0)
+  FN <- sum(true_labels == 1 & predicted_labels == 0)
+  
+  confusion_matrix.top5[[ft]] <- data.frame(
+    Fraud_Type = ft,
+    TP = TP,
+    FP = FP,
+    TN = TN,
+    FN = FN,
+    Precision = TP / (TP + FP),
+    Recall    = TP / (TP + FN),
+    F1        = 2 * TP / (2 * TP + FP + FN)
+  )
+}
+confusion_table <- do.call(rbind, confusion_matrix.top5)
+print(confusion_table)
+
+#--------------------------------------#
+# Plotting anomaly detection           #
+#--------------------------------------#
+for (ft in names(detected)) {
+  
+  x <- seq_along(actual_anomaly[[ft]])
+  y_obs <- actual_anomaly[[ft]]
+  
+  spike_idx <- anomaly_data[[ft]]$true_idx
+  detected_idx <- detected[[ft]]
+  
+  correctly_detected <- intersect(spike_idx, detected_idx)
+  false_detected <- setdiff(detected_idx, spike_idx)
+  
+  plot(x, y_obs,
+       type = "l",
+       col = "blue",
+       xlab = "Test period index",
+       ylab = "Value",
+       main = paste("Forecast with Injected and Detected Anomalies -", ft))
+  
+  lines(x, as.numeric(forecast_anomaly[[ft]]), lty = 2)
+  
+  points(spike_idx, y_obs[spike_idx],
+         col = "red", pch = 16, cex = 1.2)
+  
+  points(correctly_detected, y_obs[correctly_detected],
+         col = "black", pch = 8, cex = 1.8, lwd = 2)
+  
+  points(false_detected, y_obs[false_detected],
+         col = "purple", pch = 4, cex = 1.5, lwd = 2)
+  
+  legend("topright",
+         legend = c("Injected spikes", "Correctly detected", "False positives"),
+         col = c("red", "black", "purple"),
+         pch = c(16, 8, 4),
+         pt.cex = c(1.2, 1.8, 1.5),
+         bty = "n")
+}
+
+#---------------------------------------------------------------#
+# Anomaly Detection validation by number of months forecasted   #
+#---------------------------------------------------------------#
+n_runs <- 10
+all_cumulative_runs <- list()
+
+for (run in 1:n_runs) {
+  
+  anomaly_data <- list()
+  forecast_anomaly <- list()
+  actual_anomaly   <- list()
+  detected <- list()
+  
+  # -----------------------#
+  # Inject anomalies       #
+  # -----------------------#
+  for (ft in names(test_list)) {
+    
+    test_series <- test_list[[ft]]$total_victims
+    
+    injected <- inject_anomalies(test_series, k = 3)
+    
+    anomaly_data[[ft]] <- list(
+      contaminated = injected$contaminated_series,
+      true_idx     = injected$spike_indices
+    )
+  }
+  
+  # ------------------#
+  # Forecast          #
+  # ------------------#
+  for (ft in names(models)) {
+    
+    contaminated_ts <- ts(anomaly_data[[ft]]$contaminated, frequency = 7)
+    h <- length(contaminated_ts)
+    
+    fc <- forecast(models[[ft]], h = h)
+    
+    forecast_anomaly[[ft]] <- as.numeric(fc$mean)
+    actual_anomaly[[ft]]   <- as.numeric(contaminated_ts)
+  }
+  
+  # --------------#
+  # Detection     #
+  # --------------#
+  for (ft in names(forecast_anomaly)) {
+    
+    predicted <- forecast_anomaly[[ft]]
+    actual <- actual_anomaly[[ft]]
+    
+    residuals <- abs(actual - predicted)
+    threshold <- mean(residuals) + 3 * sd(residuals)
+    
+    detected[[ft]] <- which(residuals > threshold)
+  }
+  
+  # ------------------------------#
+  # Cumulative Evaluation Metrics #
+  # ------------------------------#
+  
+  cumulative_results_all <- list()
+  
+  for (ft in names(models)) {
+    
+    y <- actual_anomaly[[ft]]
+    n <- length(y)
+    
+    spike_idx <- anomaly_data[[ft]]$true_idx
+    detected_idx <- detected[[ft]]
+    
+    true_labels <- rep(0, n)
+    pred_labels <- rep(0, n)
+    
+    true_labels[spike_idx] <- 1
+    pred_labels[detected_idx] <- 1
+    
+    cutoffs <- seq(30, n, by = 30)
+    
+    df <- data.frame()
+    
+    for (c in cutoffs) {
+      
+      t <- true_labels[1:c]
+      p <- pred_labels[1:c]
+      
+      TP <- sum(t == 1 & p == 1)
+      FP <- sum(t == 0 & p == 1)
+      FN <- sum(t == 1 & p == 0)
+      
+      df <- rbind(df, data.frame(
+        Fraud_Type = ft,
+        Horizon = c,
+        TP = TP,
+        FP = FP,
+        FN = FN,
+        Run = run
+      ))
+    }
+    
+    cumulative_results_all[[ft]] <- df
+  }
+  
+  all_cumulative_runs[[run]] <- do.call(rbind, cumulative_results_all)
+}
+
+#Pooling results for all 10 runs
+all_cumulative_df <- do.call(rbind, all_cumulative_runs)
+
+pooled_results <- aggregate(cbind(TP, FP, FN) ~ Fraud_Type + Horizon,
+                            data = all_cumulative_df,
+                            sum)
+
+#Computing Metrics with pooled results
+pooled_results$Precision <- with(pooled_results,
+                                 ifelse((TP + FP) == 0, 0, TP / (TP + FP)))
+
+pooled_results$Recall <- with(pooled_results,
+                              ifelse((TP + FN) == 0, 0, TP / (TP + FN)))
+
+pooled_results$F1 <- with(pooled_results,
+                          ifelse((Precision + Recall) == 0, 0,
+                                 2 * Precision * Recall / (Precision + Recall)))
+
+
+cumulative_results <- pooled_results[, c("Fraud_Type", "Horizon", "Recall", "Precision", "F1")]
+fraud_types <- unique(cumulative_results$Fraud_Type)
+
+
+#Plotting Recall versus forecast horizon 95% intervals for all 5 fraud types
+plot(NULL,
+     xlim = c(0, max(cumulative_results$Horizon)),
+     ylim = c(0, 1),
+     xlab = "Forecast Horizon (Days)",
+     ylab = "Recall",
+     main = "Anomaly Detection vs Forecast Horizon")
+
+colors <- rainbow(length(fraud_types))
+
+for (i in seq_along(fraud_types)) {
+  
+  ft <- fraud_types[i]
+  df <- subset(cumulative_results, Fraud_Type == ft)
+  
+  lines(df$Horizon,
+        df$Recall,
+        type = "b",
+        col = colors[i],
+        pch = 16)
+}
+
+legend("bottomleft",
+       legend = fraud_types,
+       col = colors,
+       lty = 1,
+       pch = 16,
+       cex = 0.8)
+
+#Saving all anomaly detection metrics to a single csv and exporting for powerbi
+AD_all_df <- rbind(AD_total_df, cumulative_results)
+write.csv(AD_all_df,
+          "recall_vs_horizon_all_models.csv",
+          row.names = FALSE)
+```
+
+```{r refitting and final top 5 fraud report count models}
+#--------------------------------------#
+# Refitting models on full data now    #
+#--------------------------------------#
+full_data <- split(fraud_data_top5, fraud_data_top5$Fraud_type)
+
+fc_final_ft <- list()
+for (ft in names(full_data)) {
+  
+  # Get the full dataset for this fraud type
+  df <- full_data[[ft]]
+  
+  #Change to time series
+   ts_full <- ts(
+    df$total_victims,
+    start = c(2021, 1),  # adjust if your data doesn’t start in week 1 of 2021
+    frequency = 7        # weekly frequency
+  )
+  old_arima <- arimaorder(models[[ft]])
+fit_full.arima <- Arima(ts_full, order = old_arima[1:3], 
+                        seasonal = old_arima[4:6])
+  fc_final_ft[[ft]] <-forecast(fit_full.arima,h=240)
+}
+
+#--------------------------------------#
+# Convert Forecasts to Table           #
+#--------------------------------------#
+all_forecasts <- do.call(
+  rbind,
+  lapply(names(fc_final_ft), function(ft) {
+    
+    fc <- fc_final_ft[[ft]]
+    
+    forecast_table(
+      fc          = fc,
+      fraud_type  = ft,
+      metric      = "Victim_Count"
+    )
+  })
+)
+  
+```
+
+
+```{r modeling top 5 fraud types monetary loss}
+#---------------------------------------------------------#
+# Fit ARIMA Models and Forecast Case Counts by Fraud Type #
+#---------------------------------------------------------#
+models.loss <- list()
+forecasts_cases.loss <- list()
+actual_cases.loss <- list()
+normalized_metrics <- list()
+
+  for (ft in names(train_list)) {
+  
+  train_ft <- train_list[[ft]]
+  test_ft  <- test_list[[ft]]
+  
+  # ------------------------#
+  # Changing to time series #
+  # ------------------------#
+  ts_cases.loss <- ts(
+    train_ft$total_loss,
+    start = c(2021, 1),
+    frequency = 7
+  )
+  
+  # Create ARIMA model
+  fit_cases.loss <- auto.arima(ts_cases.loss)
+  
+  h_cases <- nrow(test_ft)
+  
+  # Forecast the ARIMA model
+  fc_cases.loss <- forecast(fit_cases.loss, h = h_cases)
+  
+  # Convert test cases to time series
+  test_cases_ts.loss <- ts(
+    test_ft$total_loss,
+    start = time(fc_cases.loss$mean)[1],
+    frequency = frequency(fc_cases.loss$mean)
+  )
+  
+  models.loss[[ft]]          <- fit_cases.loss
+  forecasts_cases.loss[[ft]] <- fc_cases.loss
+  actual_cases.loss[[ft]]    <- test_cases_ts.loss
+  
+  #computing MAE and RMSE of
+  acc <- accuracy(fc_cases.loss, test_cases_ts.loss)
+  range_val <- max(test_cases_ts.loss) - min(test_cases_ts.loss)
+   normalized_metrics[[ft]] <- data.frame(
+    NMAE  = acc["Test set", "MAE"] / range_val,
+    NRMSE = acc["Test set", "RMSE"] / range_val
+  )
+  }
+
+models_tbats.loss <- list()
+forecasts_cases_tbats.loss <- list()
+actual_cases_tbats.loss <- list()
+normalized_metrics_tbats <- list()
+
+ for (ft in names(train_list)) {
+  train_ft <- train_list[[ft]]
+  test_ft  <- test_list[[ft]]
+# --------------------------#
+# Changing to time series   #
+# --------------------------#
+  ts_cases.loss <- ts(
+    train_ft$total_loss,
+    start = c(2021, 1),
+    frequency=7
+  )
+  
+  # Create TBATS model
+  fit_cases.loss <- tbats(ts_cases.loss)
+  
+  h_cases <- nrow(test_ft)
+  
+  # Forecast the ARIMA model
+  fc_cases_tbats.loss <- forecast(fit_cases.loss, h = h_cases)
+  
+  # Convert test cases to time series
+  test_cases_ts.loss <- ts(
+    test_ft$total_loss,
+    start = time(fc_cases_tbats.loss$mean)[1],
+    frequency = frequency(fc_cases_tbats.loss$mean)
+  )
+  
+  models_tbats.loss[[ft]]          <- fit_cases.loss
+  forecasts_cases_tbats.loss[[ft]] <- fc_cases_tbats.loss
+  actual_cases_tbats.loss[[ft]]    <- test_cases_ts.loss
+  
+  #computing MAE and RMSE of
+  acc <- accuracy(fc_cases_tbats.loss, test_cases_ts.loss)
+  range_val <- max(test_cases_ts.loss) - min(test_cases_ts.loss)
+   normalized_metrics_tbats[[ft]] <- data.frame(
+    NMAE  = acc["Test set", "MAE"] / range_val,
+    NRMSE = acc["Test set", "RMSE"] / range_val
+  )
+  }
+
+# -----------------------#
+# Combining results      #
+# -----------------------#
+arima_df <- do.call(rbind, lapply(names(normalized_metrics), function(nm) { #converting to a single dataframe
+  df <- normalized_metrics[[nm]]
+  df$Fraud_Type <- nm
+  df
+}))
+
+tbats_df <- do.call(rbind, lapply(names(normalized_metrics_tbats), function(nm) { #converting to a single dataframe
+  df <- normalized_metrics_tbats[[nm]]
+  df$Fraud_Type <- nm
+  df
+}))
+
+names(arima_df)[1:2] <- c("NMAE_ARIMA", "NRMSE_ARIMA")
+names(tbats_df)[1:2] <- c("NMAE_TBATS", "NRMSE_TBATS")
+
+combined_df.loss <- merge(arima_df, tbats_df, by = "Fraud_Type") #Combining dataframes
+combined_df.loss
+
+#--------------------------------------#
+# Refitting models on full data now    #
+#--------------------------------------#
+full_data <- split(fraud_data_top5, fraud_data_top5$Fraud_type)
+
+fc_final_ft_tbats.loss <- list()
+final_tbats_model.loss <- list()
+for (ft in names(full_data)) {
+  
+  # Get the full dataset for this fraud type
+  df <- full_data[[ft]]
+  
+  #Change to time series
+   ts_full <- ts(
+    df$total_loss,
+    start = c(2021, 1),
+    frequency = 7      
+  )
+  final_tbats_model.loss[[ft]] <- tbats(ts_full,models_tbats.loss[[ft]])
+  fc_final_ft_tbats.loss[[ft]] <- forecast(final_tbats_model.loss[[ft]],h=240)
+}
+
+#Removing Identity fraud as it has no values
+fc_final_ft_tbats.loss <- fc_final_ft_tbats.loss[
+  names(fc_final_ft_tbats.loss) != "Identity Fraud"
+]
+
+for (ft in names(fc_final_ft_tbats.loss)) {
+  
+  plot(fc_final_ft_tbats.loss[[ft]],
+       main = paste("Forecast -", ft))
+
+}
+
+#--------------------------------------#
+# Convert Forecasts to Table           #
+#--------------------------------------#
+all_forecasts_tbats.loss <- do.call(
+  rbind,
+  lapply(names(fc_final_ft_tbats.loss), function(ft) {
+    fc <- fc_final_ft_tbats.loss[[ft]]
+    forecast_table(fc = fc, fraud_type = ft, metric = "Monetary_Loss")
+  })
+)
+```
+
+
+```{r combining forecasts and exporting}
+#--------------------------------------#
+# Combining forecasts                  #
+#--------------------------------------#
+tables <- list(
+  all_fraud_fc,
+  all_forecasts,
+  all_Loss_fc,
+  all_forecasts_tbats.loss
+)
+
+#Converting all time series columns to numeric vectors
+make_numeric_ts <- function(df) {
+  df[] <- lapply(df, function(x) if (is.ts(x)) as.numeric(x) else x)
+  df
+}
+tables <- lapply(tables, make_numeric_ts)
+combined_table <- do.call(rbind, tables)
+write.csv(combined_table, "combined_forecasts.csv", row.names = FALSE)
+
+```
+  
+  
+  
+  
+  
+
+
