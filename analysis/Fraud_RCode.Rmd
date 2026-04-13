@@ -923,39 +923,42 @@ tbl <- kbl(
 models <- list()
 forecasts_cases <- list()
 actual_cases <- list()
+naive_forecasts_cases <- list()
 
 for (ft in names(train_list)) {
   
   train_ft <- train_list[[ft]]
   test_ft  <- test_list[[ft]]
   
-  # -----------------------------------#
-  # Model Fitting for each Fraud Type  #
-  # -----------------------------------#
   ts_cases <- ts(
     train_ft$total_victims,
     start = c(2021, 1),
     frequency = 7
   )
   
-  # Create ARIMA model
+  # -------------------#
+  # ARIMA Model        #
+  # -------------------#
   fit_cases <- auto.arima(ts_cases)
-  
   h_cases <- nrow(test_ft)
-  
-  # Forecast the ARIMA model
   fc_cases <- forecast(fit_cases, h = h_cases)
   
-  # Convert test cases to time series for validation
+  # -------------------#
+  # Naive Model        #
+  # -------------------#
+  fc_naive <- naive(ts_cases, h = h_cases)
+  
+  # Convert test set
   test_cases_ts <- ts(
     test_ft$total_victims,
     start = time(fc_cases$mean)[1],
     frequency = frequency(fc_cases$mean)
   )
   
-  models[[ft]]          <- fit_cases
-  forecasts_cases[[ft]] <- fc_cases
-  actual_cases[[ft]]    <- test_cases_ts
+  models[[ft]]               <- fit_cases
+  forecasts_cases[[ft]]      <- fc_cases
+  naive_forecasts_cases[[ft]] <- fc_naive   
+  actual_cases[[ft]]         <- test_cases_ts
 }
 
 
@@ -969,14 +972,14 @@ for (ft in names(forecasts_cases)) {
        include = 60)
   
   lines(actual_cases[[ft]], col = "red", lwd = 2)
+  lines(naive_forecasts_cases[[ft]]$mean, col = "green", lwd = 2)
   
   legend("topleft",
-         legend = c("Forecast", "Actual"),
-         col = c("blue", "red"),
+         legend = c("ARIMA", "Actual", "Naive"),
+         col = c("blue", "red", "green"),
          lty = 1,
          lwd = 2)
 }
-
 
 # ----------------------------------------------#
 # Rolling Window Validation                     #
@@ -1026,16 +1029,13 @@ for (ft in names(rolling_results_cases)) {
 }
 
 
-# ----------------------------------------------#
-# Error Metrics Table                           #
-# ----------------------------------------------#
+# -------------------------------------------------------#
+# Error Metrics Table Rolling Window Cross Validation    #
+# -------------------------------------------------------#
 
 results_table_cases <- data.frame( #storing results of rolling window cross validation
   Fraud_Type = names(rolling_results_cases),
-  
-  MAE  = sapply(rolling_results_cases, function(x) x$MAE),
-  RMSE = sapply(rolling_results_cases, function(x) x$RMSE),
-  
+  Model = "ARIMA",
   NMAE = sapply(rolling_results_cases, function(x) { #computing normalized MAE
     valid_actual <- x$actual[!is.na(x$forecast)]
     x$MAE / (max(valid_actual) - min(valid_actual))
@@ -1049,6 +1049,7 @@ results_table_cases <- data.frame( #storing results of rolling window cross vali
 # ----------------------------------------------#
 # One Time Validation                           #
 # ----------------------------------------------#
+
 for (fraud_type in names(test_list)) {
   
   # Extract test data
@@ -1059,37 +1060,76 @@ for (fraud_type in names(test_list)) {
     frequency = 7
   )
   
-  # Forecast
   h <- length(test_ts)
-  fc <- forecast(models[[fraud_type]], h = h)
   
-  pred <- as.numeric(fc$mean)
+  # -------------------#
+  # ARIMA Forecast     #
+  # -------------------#
+  fc_arima <- forecast(models[[fraud_type]], h = h)
+  pred_arima <- as.numeric(fc_arima$mean)
+  
+  # -------------------#
+  # Naive Forecast     #
+  # -------------------#
+  
+  # Fit naive model + forecast
+  fc_naive <- naive_forecasts_cases[[fraud_type]]
+
+  pred_naive <- as.numeric(fc_naive$mean)
+
   actual <- as.numeric(test_ts)
   
-  # Metrics
-  residuals <- actual - pred
+  # -------------------#
+  # ARIMA Metrics      #
+  # -------------------#
+  res_arima <- actual - pred_arima
   
-  MAE  <- mean(abs(residuals))
-  RMSE <- sqrt(mean(residuals^2))
+  MAE_arima  <- mean(abs(res_arima))
+  RMSE_arima <- sqrt(mean(res_arima^2))
+  
+  # -------------------#
+  # Naive Metrics      #
+  # -------------------#
+  res_naive <- actual - pred_naive
+  
+  MAE_naive  <- mean(abs(res_naive))
+  RMSE_naive <- sqrt(mean(res_naive^2))
   
   range_val <- max(actual) - min(actual)
   
-  NMAE  <- MAE / range_val
-  NRMSE <- RMSE / range_val
+  # -------------------#
+  # Append BOTH        #
+  # -------------------#
   
-  # Append results
-  results_table_cases <- rbind(
-    results_table_cases,
-    data.frame(
-      Fraud_Type = paste0(fraud_type, " (One-Time Test)"),
-      MAE = MAE,
-      RMSE = RMSE,
-      NMAE = NMAE,
-      NRMSE = NRMSE
-    )
+# Append ARIMA results
+ results_table_cases <- rbind(
+  results_table_cases,
+  data.frame(
+    Fraud_Type = paste0(fraud_type, " ", "(One-Time Validation)"),
+    Model = "ARIMA",
+    NMAE = MAE_arima / range_val,
+    NRMSE = RMSE_arima / range_val
   )
+)
+
+# Append NAIVE results 
+results_table_cases <- rbind(
+  results_table_cases,
+  data.frame(
+    Fraud_Type = paste0(fraud_type),
+    Model = "NAIVE",
+    NMAE = MAE_naive / range_val,
+    NRMSE = RMSE_naive / range_val
+  )
+)
 }
-results_table_cases
+
+#Reordering to keep ARIMA results together and NAIVE results together.
+results_table_cases <- results_table_cases[
+  order(results_table_cases$Model, results_table_cases$Fraud_Type),
+]
+
+knitr::kable(results_table_cases)
 ```
 
 ```{r anomaly detection of top 5 fraud type models}
@@ -1431,9 +1471,9 @@ all_forecasts <- do.call(
 
 
 ```{r modeling top 5 fraud types monetary loss}
-#---------------------------------------------------------#
-# Fit ARIMA Models and Forecast Case Counts by Fraud Type #
-#---------------------------------------------------------#
+#-----------------------------------------------------------#
+# Fit ARIMA Models and Forecast monetary loss by Fraud Type #
+#-----------------------------------------------------------#
 models.loss <- list()
 forecasts_cases.loss <- list()
 actual_cases.loss <- list()
@@ -1481,6 +1521,10 @@ normalized_metrics <- list()
   )
   }
 
+#-----------------------------------------------------------#
+# Fit TBATS Models and Forecast monetary loss by Fraud Type #
+#-----------------------------------------------------------#
+
 models_tbats.loss <- list()
 forecasts_cases_tbats.loss <- list()
 actual_cases_tbats.loss <- list()
@@ -1526,6 +1570,52 @@ normalized_metrics_tbats <- list()
   )
   }
 
+#-----------------------------------------------------------#
+# Fit NAIVE Models and Forecast monetary loss by Fraud Type #
+#-----------------------------------------------------------#
+normalized_metrics_naive <- list()
+
+for (ft in names(train_list)) {
+  
+  train_ft <- train_list[[ft]]
+  test_ft  <- test_list[[ft]]
+  
+  ts_cases.loss <- ts(
+    train_ft$total_loss,
+    start = c(2021, 1),
+    frequency = 7
+  )
+  
+  h_cases <- nrow(test_ft)
+  
+  # -------------------#
+  # Naive Model        #
+  # -------------------#
+  fc_naive.loss <- naive(ts_cases.loss, h = h_cases)
+  
+  test_cases_ts.loss <- ts(
+    test_ft$total_loss,
+    start = time(fc_naive.loss$mean)[1],
+    frequency = frequency(fc_naive.loss$mean)
+  )
+  
+  acc <- accuracy(fc_naive.loss, test_cases_ts.loss)
+  range_val <- max(test_cases_ts.loss) - min(test_cases_ts.loss)
+  
+  normalized_metrics_naive[[ft]] <- data.frame(
+    NMAE  = acc["Test set", "MAE"] / range_val,
+    NRMSE = acc["Test set", "RMSE"] / range_val
+  )
+}
+
+naive_df <- do.call(rbind, lapply(names(normalized_metrics_naive), function(nm) {
+  df <- normalized_metrics_naive[[nm]]
+  df$Fraud_Type <- nm
+  df
+}))
+
+#renaming columns
+names(naive_df)[1:2] <- c("NMAE_NAIVE", "NRMSE_NAIVE")
 # -----------------------#
 # Combining results      #
 # -----------------------#
@@ -1544,8 +1634,10 @@ tbats_df <- do.call(rbind, lapply(names(normalized_metrics_tbats), function(nm) 
 names(arima_df)[1:2] <- c("NMAE_ARIMA", "NRMSE_ARIMA")
 names(tbats_df)[1:2] <- c("NMAE_TBATS", "NRMSE_TBATS")
 
-combined_df.loss <- merge(arima_df, tbats_df, by = "Fraud_Type") #Combining dataframes
-combined_df.loss
+combined_df.loss <- merge(arima_df, tbats_df, by = "Fraud_Type") #Combining arima and tbats dataframes
+combined_df.loss <- merge(combined_df.loss, naive_df, by = "Fraud_Type") #combining with naive model results
+
+knitr::kable(combined_df.loss)
 
 #--------------------------------------#
 # Refitting models on full data now    #
