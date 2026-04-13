@@ -911,7 +911,7 @@ tbl <- kbl(
   column_spec(4, width = "4em") |>
   column_spec(5, width = "4em")
 
-
+tbl
 ```
 
 
@@ -1129,7 +1129,25 @@ results_table_cases <- results_table_cases[
   order(results_table_cases$Model, results_table_cases$Fraud_Type),
 ]
 
-knitr::kable(results_table_cases)
+top5_fraud_tbl<- kbl(
+  results_table_cases,
+  format = "html",
+  booktabs = TRUE,
+  align = c("l", "l", "c", "c"),
+  digits = 3,
+  row.names=FALSE
+) |>
+  kable_styling(
+    full_width = FALSE,
+    position = "center",
+    font_size = 14
+  ) |>
+  column_spec(1, width = "4em") |>
+  column_spec(2, width = "7em") |>
+  column_spec(3, width = "4em") |>
+  column_spec(4, width = "4em") 
+
+top5_fraud_tbl
 ```
 
 ```{r anomaly detection of top 5 fraud type models}
@@ -1637,7 +1655,28 @@ names(tbats_df)[1:2] <- c("NMAE_TBATS", "NRMSE_TBATS")
 combined_df.loss <- merge(arima_df, tbats_df, by = "Fraud_Type") #Combining arima and tbats dataframes
 combined_df.loss <- merge(combined_df.loss, naive_df, by = "Fraud_Type") #combining with naive model results
 
-knitr::kable(combined_df.loss)
+top5_loss_tbl<- kbl(
+  combined_df.loss,
+  format = "html",
+  booktabs = TRUE,
+  align = c("l", "l", "c", "c","c","c","c"),
+  digits = 3,
+  row.names=FALSE
+) |>
+  kable_styling(
+    full_width = FALSE,
+    position = "center",
+    font_size = 14
+  ) |>
+  column_spec(1, width = "4em") |>
+  column_spec(2, width = "7em") |>
+  column_spec(3, width = "4em") |>
+  column_spec(4, width = "4em") |>
+  column_spec(5, width = "4em") |>
+  column_spec(6, width = "4em") |>
+  column_spec(7, width = "4em") 
+
+top5_loss_tbl
 
 #--------------------------------------#
 # Refitting models on full data now    #
