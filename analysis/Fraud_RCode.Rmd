@@ -1440,7 +1440,7 @@ legend("bottomleft",
 #Saving all anomaly detection metrics to a single csv and exporting for powerbi
 AD_all_df <- rbind(AD_total_df, cumulative_results)
 write.csv(AD_all_df,
-          "recall_vs_horizon_all_models.csv",
+          here("output", "recall_vs_horizon_all_models.csv"),
           row.names = FALSE)
 ```
 
@@ -1743,7 +1743,7 @@ make_numeric_ts <- function(df) {
 }
 tables <- lapply(tables, make_numeric_ts)
 combined_table <- do.call(rbind, tables)
-write.csv(combined_table, "combined_forecasts.csv", row.names = FALSE)
+write.csv(combined_table, here("output", "combined_forecasts.csv"), row.names = FALSE)
 
 ```
   
