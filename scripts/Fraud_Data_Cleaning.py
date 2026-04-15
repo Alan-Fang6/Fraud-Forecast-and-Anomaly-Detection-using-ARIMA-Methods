@@ -1,9 +1,25 @@
 import pandas as pd
+import glob
+import os
 
-CRFC = pd.read_csv("data/raw/cafc-open-gouv-database-2021-01-01-to-2025-09-30-extracted-2025-10-01.csv")
+#Locating csv file
+raw_data_path = "data/raw/*.csv"
+file = glob.glob(raw_data_path)
+#If no files are found
+if not file:
+    raise FileNotFoundError("No CSV file found in data/raw/")
+
+# Otherwise use the first file found
+file_path = file[0]
+print(f"Reading file: {file_path}")
+
+CRFC = pd.read_csv(file_path)
+
+CRFC = pd.read_csv(file_path
+)
 # Convert date
-CRFC['Date Received / Date recue'] = pd.to_datetime(
-    CRFC['Date Received / Date recue']
+CRFC["Date Received / Date reçue"] = pd.to_datetime(
+    CRFC["Date Received / Date reçue"]
 )
 
 #Cleaning dataset column names as they are messy and the french name is not needed
@@ -14,10 +30,10 @@ CRFC = CRFC.rename(columns={
     "Fraud and Cybercrime Thematic Categories": "FraudType",
     "Solicitation Method": "SolicitationMethod",
     "Gender": "Gender",
-    "Victim Age Range / Tranche d'age des victimes": "AgeGroup",
+    "Victim Age Range / Tranche d'âge des victimes": "AgeGroup",
     "Number of Victims / Nombre de victimes": "Victims",
-    "Dollar Loss /pertes financieres": "Monetary_Loss",
-    "Numero d'identification / Number ID": "ReportID",
+    "Dollar Loss /pertes financières": "Monetary_Loss",
+    "Numéro d'identification / Number ID": "ReportID",
     "Complaint Type": "ComplaintType"
 })
 # Monetary Loss
@@ -34,7 +50,7 @@ CRFC = CRFC[CRFC['ComplaintType'] == 'Victim']
 daily_summary = (
     CRFC
     .groupby([
-        "Date Received / Date recue",
+        "Date Received / Date reçue",
         "Province",
         "FraudType",
         "SolicitationMethod",
