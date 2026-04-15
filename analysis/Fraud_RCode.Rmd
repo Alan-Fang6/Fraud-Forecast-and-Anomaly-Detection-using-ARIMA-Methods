@@ -605,7 +605,7 @@ legend("topright",
 # Recall over cumulative forecast window horizons            #
 # -----------------------------------------------------------#
 
-# Create labels
+# Creating labels
 n <- length(y_obs)
 
 true_labels <- rep(0, n)
@@ -632,6 +632,7 @@ for (c in cutoffs) {
   FN <- sum(t == 1 & p == 0)
   TN <- sum(t == 0 & p == 0)
   
+  #Setting to 0 if it doesn't exist. I.e. there was no anomalies to detect
   recall <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
   precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
   f1 <- ifelse((precision + recall) == 0, 0, 2 * precision * recall / (precision + recall))
@@ -920,41 +921,42 @@ tbl
 # ---------------------------------------------------------#
 # Fit ARIMA Models and Forecast Case Counts by Fraud Type  #
 # ---------------------------------------------------------#
+#Storing models, forecasts, and actual test cases
 models <- list()
 forecasts_cases <- list()
 actual_cases <- list()
 naive_forecasts_cases <- list()
 
+#Creating an arima and naive model for each fraud type
 for (ft in names(train_list)) {
   
-  train_ft <- train_list[[ft]]
-  test_ft  <- test_list[[ft]]
+  train_ft <- train_list[[ft]] #Extracting individual fraud type data from the matrix of training data
+  test_ft  <- test_list[[ft]] #Extracting individual fraud type data from the matrix of testing data
   
-  ts_cases <- ts(
+  ts_cases <- ts( #Converting training data to a time series object for ARIMA modeling
     train_ft$total_victims,
     start = c(2021, 1),
     frequency = 7
   )
   
-  # -------------------#
-  # ARIMA Model        #
+  # ARIMA Model        
   # -------------------#
   fit_cases <- auto.arima(ts_cases)
   h_cases <- nrow(test_ft)
   fc_cases <- forecast(fit_cases, h = h_cases)
   
-  # -------------------#
-  # Naive Model        #
+  # Naive Model        
   # -------------------#
   fc_naive <- naive(ts_cases, h = h_cases)
   
-  # Convert test set
+  # Convert test set to time series object for forecasting against actual values later.
   test_cases_ts <- ts(
     test_ft$total_victims,
     start = time(fc_cases$mean)[1],
     frequency = frequency(fc_cases$mean)
   )
   
+  #Storing models, forecasts, and actual data for each fraud type in the loop
   models[[ft]]               <- fit_cases
   forecasts_cases[[ft]]      <- fc_cases
   naive_forecasts_cases[[ft]] <- fc_naive   
@@ -967,12 +969,12 @@ for (ft in names(train_list)) {
 # ----------------------------------------------#
 for (ft in names(forecasts_cases)) {
   
-  plot(forecasts_cases[[ft]],
+  plot(forecasts_cases[[ft]], #Plotting forecast values
        main = paste("Forecast vs Actual -", ft),
        include = 60)
   
-  lines(actual_cases[[ft]], col = "red", lwd = 2)
-  lines(naive_forecasts_cases[[ft]]$mean, col = "green", lwd = 2)
+  lines(actual_cases[[ft]], col = "red", lwd = 2) #Overlaying actual values
+  lines(naive_forecasts_cases[[ft]]$mean, col = "green", lwd = 2) #overlaying naive model forecast
   
   legend("topleft",
          legend = c("ARIMA", "Actual", "Naive"),
@@ -984,18 +986,18 @@ for (ft in names(forecasts_cases)) {
 # ----------------------------------------------#
 # Rolling Window Validation                     #
 # ----------------------------------------------#
-rolling_results_cases <- list()
+rolling_results_cases <- list() #storing results of rolling window validation
 
 for (ft in names(models)) {
   
-  test_ft <- test_list[[ft]]
+  test_ft <- test_list[[ft]] #extracting actual value for validation
   
-  test_cases_ts <- ts(
+  test_cases_ts <- ts( #converting to time series object
     test_ft$total_victims,
     frequency = 7
   )
   
-  rolling_results_cases[[ft]] <- rolling_validate_arima(
+  rolling_results_cases[[ft]] <- rolling_validate_arima( #using rolling window function to return MAE,NMAE, RMSE, NRMSE
     series = test_cases_ts,
     fitted_model = models[[ft]],
     window_size = 14,
@@ -1050,11 +1052,13 @@ results_table_cases <- data.frame( #storing results of rolling window cross vali
 # One Time Validation                           #
 # ----------------------------------------------#
 
+#Validation metrics NRMSE, NMAE for each fraud type; one-time fitting ARIMA and Naive Model
 for (fraud_type in names(test_list)) {
   
   # Extract test data
   test_data <- test_list[[fraud_type]]
   
+  #convert to time series object for forecasting
   test_ts <- ts(
     test_data$total_victims,
     frequency = 7
@@ -1062,43 +1066,45 @@ for (fraud_type in names(test_list)) {
   
   h <- length(test_ts)
   
+
+  # ARIMA Forecast     
   # -------------------#
-  # ARIMA Forecast     #
-  # -------------------#
-  fc_arima <- forecast(models[[fraud_type]], h = h)
+  fc_arima <- forecasts_cases[[fraud_type]]
   pred_arima <- as.numeric(fc_arima$mean)
   
-  # -------------------#
-  # Naive Forecast     #
-  # -------------------#
-  
-  # Fit naive model + forecast
-  fc_naive <- naive_forecasts_cases[[fraud_type]]
 
-  pred_naive <- as.numeric(fc_naive$mean)
+  # Naive Forecast     
+  # -------------------#
+  # Fitting naive model + forecast
+  fc_naive <- naive_forecasts_cases[[fraud_type]] #extracting naive model forecasts from earlier for each fraud type
 
-  actual <- as.numeric(test_ts)
-  
+  pred_naive <- as.numeric(fc_naive$mean) #converting to numeric for comparison against actuals
+
+  # Actual data      
   # -------------------#
-  # ARIMA Metrics      #
+  actual <- as.numeric(test_ts) #Converting actual data to numeric for comparison
+
+  # ARIMA Metrics      
   # -------------------#
-  res_arima <- actual - pred_arima
+  res_arima <- actual - pred_arima #Computing residuals
   
-  MAE_arima  <- mean(abs(res_arima))
-  RMSE_arima <- sqrt(mean(res_arima^2))
+  MAE_arima  <- mean(abs(res_arima)) #Computing Mean Absolute Error
+  RMSE_arima <- sqrt(mean(res_arima^2)) #Computing Root Mean Square Error
   
+
+  # Naive Metrics      
   # -------------------#
-  # Naive Metrics      #
+  res_naive <- actual - pred_naive #Computing residuals
+  
+  MAE_naive  <- mean(abs(res_naive)) #Computing Mean Absolute Error
+  RMSE_naive <- sqrt(mean(res_naive^2)) #Computing Root Mean Square Error
+  
+  # Normalization     
   # -------------------#
-  res_naive <- actual - pred_naive
+  range_val <- max(actual) - min(actual) #Computing Range of actual test data for normalization
   
-  MAE_naive  <- mean(abs(res_naive))
-  RMSE_naive <- sqrt(mean(res_naive^2))
-  
-  range_val <- max(actual) - min(actual)
-  
-  # -------------------#
-  # Append BOTH        #
+
+  # Appending BOTH        
   # -------------------#
   
 # Append ARIMA results
@@ -1129,6 +1135,7 @@ results_table_cases <- results_table_cases[
   order(results_table_cases$Model, results_table_cases$Fraud_Type),
 ]
 
+#Using Kable for reformatting of table for easier viewing.
 top5_fraud_tbl<- kbl(
   results_table_cases,
   format = "html",
@@ -1154,12 +1161,15 @@ top5_fraud_tbl
 #--------------------------------------#
 # Top 5 Anomaly Detection validation   #
 #--------------------------------------#
+
+#List objects to store anomaly data
 anomaly_data <- list()
 forecast_anomaly <- list()
 actual_anomaly   <- list()
 detected <- list()
 confusion_matrix.top5 <- list()
 
+#For each fraud type, inject synthetic anomalies into the test data with the inject_anomalies function defined earlier.
 for (ft in names(test_list)) {
   
   test_series <- test_list[[ft]]$total_victims
@@ -1172,6 +1182,7 @@ for (ft in names(test_list)) {
   )
 }
 
+#For each fraud type, 
 for (ft in names(models)) {
   
   contaminated_ts <- ts(
@@ -1183,7 +1194,7 @@ for (ft in names(models)) {
   
   fc <- forecast(models[[ft]], h = h)
   
-  forecast_anomaly[[ft]] <- as.numeric(fc$mean)
+  forecast_anomaly[[ft]] <- as.numeric(fc$upper[, "95%"])
   actual_anomaly[[ft]]   <- as.numeric(contaminated_ts)
 }
 
@@ -1191,13 +1202,9 @@ for (ft in names(forecast_anomaly)) {
   
   predicted<- forecast_anomaly[[ft]]
   actual <- actual_anomaly[[ft]]
+
   
-  residuals <- abs(actual - predicted)
-  
-  # threshold = mean + 3*sd (you can tune this)
-  threshold <- mean(residuals) + 3 * sd(residuals)
-  
-  detected_idx <- which(residuals > threshold)
+  detected_idx <- which(actual > predicted)
   
   detected[[ft]] <- detected_idx
 }
@@ -1308,8 +1315,8 @@ for (run in 1:n_runs) {
     )
   }
   
-  # ------------------#
-  # Forecast          #
+
+  # Forecast          
   # ------------------#
   for (ft in names(models)) {
     
@@ -1318,26 +1325,23 @@ for (run in 1:n_runs) {
     
     fc <- forecast(models[[ft]], h = h)
     
-    forecast_anomaly[[ft]] <- as.numeric(fc$mean)
+    forecast_anomaly[[ft]] <- as.numeric(fc$upper[,"95%"])
     actual_anomaly[[ft]]   <- as.numeric(contaminated_ts)
   }
   
-  # --------------#
-  # Detection     #
+
+  # Detection     
   # --------------#
   for (ft in names(forecast_anomaly)) {
     
     predicted <- forecast_anomaly[[ft]]
     actual <- actual_anomaly[[ft]]
-    
-    residuals <- abs(actual - predicted)
-    threshold <- mean(residuals) + 3 * sd(residuals)
-    
-    detected[[ft]] <- which(residuals > threshold)
+
+    detected[[ft]] <- which(actual > predicted)
   }
   
-  # ------------------------------#
-  # Cumulative Evaluation Metrics #
+
+  # Cumulative Evaluation Metrics 
   # ------------------------------#
   
   cumulative_results_all <- list()
@@ -1408,12 +1412,12 @@ cumulative_results <- pooled_results[, c("Fraud_Type", "Horizon", "Recall", "Pre
 fraud_types <- unique(cumulative_results$Fraud_Type)
 
 
-#Plotting Recall versus forecast horizon 95% intervals for all 5 fraud types
+#Plotting F1-Score versus forecast horizon 95% intervals for all 5 fraud types
 plot(NULL,
      xlim = c(0, max(cumulative_results$Horizon)),
      ylim = c(0, 1),
      xlab = "Forecast Horizon (Days)",
-     ylab = "Recall",
+     ylab = "F1-Score",
      main = "Anomaly Detection vs Forecast Horizon")
 
 colors <- rainbow(length(fraud_types))
@@ -1424,7 +1428,7 @@ for (i in seq_along(fraud_types)) {
   df <- subset(cumulative_results, Fraud_Type == ft)
   
   lines(df$Horizon,
-        df$Recall,
+        df$F1,
         type = "b",
         col = colors[i],
         pch = 16)
