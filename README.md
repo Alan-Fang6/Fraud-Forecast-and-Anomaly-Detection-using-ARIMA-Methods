@@ -10,8 +10,9 @@ pre-cleaned and aggregated data is available under /data/processed
 # How to Run
 1. Clone the repository
 2. Open the R Project
-3. Run scripts/aggregate_data.py (data already run through this Python script is available in data/processed)
+3. Run scripts/Fraud_Data_Cleaning.py (data already run through this Python script is available in data/processed and will be replaced on rerunning)
 4. Run individual code chunks as needed in analysis/Fraud_RCode.RMD
-5. Csv file outputs for F1/Recall/Precision versus forecast horizon, as well as model forecasts, will be written to /output
+5. Alternatively run scripts/Fraud_Forecast_Script.R to create forecast CSV files without diagnostics/validation metrics or anomaly detection.
+6. Csv file outputs for F1/Recall/Precision versus forecast horizon, as well as model forecasts, will be written to /output
 
 
