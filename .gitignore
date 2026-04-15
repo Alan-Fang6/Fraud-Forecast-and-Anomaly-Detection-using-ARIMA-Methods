@@ -4,6 +4,6 @@
 .Ruserdata
 data/raw/*.csv
 data/raw/*
-!data.raw/.gitkeep
+!data/raw/.gitkeep
 output/*
 !output/.gitkeep
