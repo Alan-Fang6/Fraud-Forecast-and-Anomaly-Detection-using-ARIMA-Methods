@@ -16,3 +16,6 @@ pre-cleaned and aggregated data is available under /data/processed
 6. Csv file outputs for F1/Recall/Precision versus forecast horizon, as well as model forecasts, will be written to /output
 
 
+
+Disclaimer:
+AI was utilised for, and only in, reformatting of code as well as the addition of subheaders for easier reading within the R code. 
