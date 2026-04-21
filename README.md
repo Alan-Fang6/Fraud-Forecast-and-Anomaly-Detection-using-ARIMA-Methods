@@ -18,4 +18,4 @@ pre-cleaned and aggregated data is available under /data/processed
 
 
 Disclaimer:
-AI was utilised for, and only in, reformatting of code as well as the addition of subheaders for easier reading within the R code. 
+AI was utilised for, and only in, reformatting of code chunks as well as the addition of subheaders for easier reading within the R code. 
